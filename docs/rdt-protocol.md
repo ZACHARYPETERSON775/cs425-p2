@@ -64,6 +64,11 @@ DATA is written; duplicate and out-of-order datagrams are discarded and elicit
 the current cumulative ACK. When the oldest outstanding DATA times out, the
 sender retransmits its entire outstanding window.
 
+While awaiting transfer packets, the receiver exits with failure after 30
+seconds without receiving a valid RDT datagram. Valid packets restart this idle
+timer; malformed or checksum-invalid datagrams do not. After accepting FIN, the
+receiver uses the separate bounded FIN linger period described below.
+
 The final chunk may contain fewer than 1024 bytes. FIN uses the next DATA
 sequence number and carries the sender's timeout as a two-byte payload, allowing
 the receiver to linger long enough to answer a retransmitted FIN if its ACK was

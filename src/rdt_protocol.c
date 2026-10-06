@@ -9,6 +9,7 @@
 
 #define FIN_MAX_TIMEOUTS 10U
 #define FIN_LINGER_EXTRA_MS UINT64_C(1000)
+#define RECEIVE_IDLE_TIMEOUT_MS 30000
 
 struct received_packet
 {
@@ -352,10 +353,16 @@ int rdt_protocol_receive(const struct rdt_protocol_io *io,
   for (;;)
   {
     struct received_packet received;
-    int receive_result = receive_packet(io, -1, &received);
+    int receive_result = receive_packet(io, RECEIVE_IDLE_TIMEOUT_MS,
+                                        &received);
 
     if (receive_result < 0)
     {
+      return 1;
+    }
+    if (receive_result == 1)
+    {
+      fprintf(stderr, "Receiver timed out after 30 seconds without a valid packet\n");
       return 1;
     }
     if (received.type == RDT_DATA)

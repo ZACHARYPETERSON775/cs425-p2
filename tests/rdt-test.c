@@ -891,6 +891,35 @@ static void test_receiver_linger_reacks_duplicate_fin_and_data(void)
   TEST_ASSERT_EQUAL_UINT64(50U * 10U + 1000U, test.now_ms - start_ms);
 }
 
+static void test_receiver_gives_up_after_30_seconds_without_valid_packet(void)
+{
+  struct linger_test_context test = {.now_ms = 500U};
+  struct rdt_protocol_io io = {
+    .context = &test,
+    .send_datagram = linger_test_send,
+    .receive_datagram = linger_test_receive,
+    .now_ms = linger_test_clock,
+    .read_file = linger_test_read,
+    .write_file = linger_test_write,
+    .flush_file = linger_test_flush
+  };
+  struct rdt_options options = {
+    .session = "idle-timeout",
+    .window_size = 4U,
+    .timeout_ms = 50U,
+    .port = 4250U,
+    .loss = 0.0,
+    .corrupt = 0.0,
+    .duplicate = 0.0
+  };
+  uint64_t start_ms = test.now_ms;
+
+  TEST_ASSERT_EQUAL_INT(1, rdt_protocol_receive(&io, &options));
+  TEST_ASSERT_EQUAL_UINT64(UINT64_C(30000), test.now_ms - start_ms);
+  TEST_ASSERT_EQUAL_UINT(0U, test.written_length);
+  TEST_ASSERT_EQUAL_UINT(0U, test.acknowledgement_count);
+}
+
 static void test_null_and_invalid_pointer_arguments(void)
 {
   struct rdt_options options = {
@@ -1073,6 +1102,7 @@ int main(void)
   RUN_TEST(test_send_file_failures);
   RUN_TEST(test_receive_output_open_failure);
   RUN_TEST(test_receiver_linger_reacks_duplicate_fin_and_data);
+  RUN_TEST(test_receiver_gives_up_after_30_seconds_without_valid_packet);
   RUN_TEST(test_null_and_invalid_pointer_arguments);
   RUN_TEST(test_sender_relay_rejection);
   RUN_TEST(test_receiver_relay_rejection);

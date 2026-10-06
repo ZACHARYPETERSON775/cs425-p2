@@ -1,8 +1,8 @@
 # Project X
 
-- Name: John Doe
-- Email: johndoe@u.boisestate.edu
-- Class: CS123-001
+- Name: Zachary Peterson
+- Email: zacharypeterson775@u.boisestate.edu
+- Class: CS425-001
 
 ## Known Bugs or Issues
 
