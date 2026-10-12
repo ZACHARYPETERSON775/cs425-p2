@@ -51,6 +51,13 @@ struct rdt_options
 int rdt_validate_session(const char *session);
 
 /**
+ * Compute the Internet checksum (RFC 1071) for a byte sequence.
+ * An odd final byte is treated as the high byte of a zero-padded 16-bit word.
+ * Returns zero for a NULL byte pointer with a nonzero length.
+ */
+uint16_t rdt_checksum(const uint8_t *bytes, size_t length);
+
+/**
  * Encode one RDT datagram into its wire representation.
  *
  * The header consists of type, a zero reserved byte, a 16-bit Internet
@@ -93,14 +100,14 @@ int rdt_decode_packet(const uint8_t *packet, size_t packet_length,
  *
  * Registers as the session sender, sends the file in RDT_MAX_PAYLOAD-sized
  * DATA chunks, retransmits unacknowledged windows on timeout, then retries FIN
- * until its final ACK arrives or ten FIN timeouts expire.
+ * until its final ACK arrives or ten timeouts without progress expire.
  *
  * @param host Relay host name or numeric address.
  * @param port Relay UDP port.
  * @param path Path to the regular input file.
  * @param options Transfer and relay settings.
- * @return 0 on success, 2 if FIN receives no ACK after ten retransmission
- *         timeouts, or 1 for other failures.
+ * @return 0 on success, 2 if DATA or FIN makes no progress after ten
+ *         consecutive timeouts, or 1 for other failures.
  */
 int rdt_send_file(const char *host, unsigned short port, const char *path,
                   const struct rdt_options *options);
@@ -117,8 +124,8 @@ int rdt_send_file(const char *host, unsigned short port, const char *path,
  * @param port Relay UDP port.
  * @param path Destination file path; it is opened/truncated after registration.
  * @param options Transfer and relay settings.
- * @return 0 on success, or nonzero if opening/writing the file, communicating
- *         with the relay, or completing the transfer fails.
+ * @return 0 on success, 2 if no valid packet arrives for 30 seconds, or 1 for
+ *         other file or communication failures.
  */
 int rdt_receive_file(const char *host, unsigned short port, const char *path,
                      const struct rdt_options *options);

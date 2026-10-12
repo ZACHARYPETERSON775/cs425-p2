@@ -1,12 +1,6 @@
 #include "rdt.h"
 
-#include "rdt_io.h"
-#include "rdt_protocol.h"
-
 #include <arpa/inet.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <stdio.h>
 #include <string.h>
 
 /*
@@ -39,37 +33,39 @@ static void write_u32(uint8_t *bytes, uint32_t value)
   memcpy(bytes, &network_value, sizeof(network_value));
 }
 
-/* Internet checksum with the checksum field temporarily treated as zero. */
-static uint16_t internet_checksum(const uint8_t *packet, size_t length,
-                                 int zero_checksum)
+static uint16_t checksum_bytes(const uint8_t *bytes, size_t length,
+                               int zero_checksum_field)
 {
   uint32_t sum = 0U;
   size_t offset = 0U;
 
+  if (bytes == NULL && length > 0U)
+  {
+    return 0U;
+  }
   while (offset + 1U < length)
   {
-    uint16_t word;
-    if (zero_checksum != 0 && offset == 2U)
-    {
-      word = 0U;
-    }
-    else
-    {
-      word = (uint16_t) (((uint16_t) packet[offset] << 8) |
-                         (uint16_t) packet[offset + 1U]);
-    }
+    uint16_t word = zero_checksum_field != 0 && offset == 2U
+                        ? 0U
+                        : (uint16_t) (((uint16_t) bytes[offset] << 8) |
+                                      (uint16_t) bytes[offset + 1U]);
     sum += (uint32_t) word;
     offset += 2U;
   }
   if (offset < length)
   {
-    sum += (uint32_t) ((uint16_t) packet[offset] << 8);
+    sum += (uint32_t) ((uint16_t) bytes[offset] << 8);
   }
   while ((sum >> 16) != 0U)
   {
     sum = (sum & UINT32_C(0xffff)) + (sum >> 16);
   }
   return (uint16_t) ~sum;
+}
+
+uint16_t rdt_checksum(const uint8_t *bytes, size_t length)
+{
+  return checksum_bytes(bytes, length, 0);
 }
 
 int rdt_validate_session(const char *session)
@@ -125,7 +121,7 @@ size_t rdt_encode_packet(uint8_t *packet, size_t capacity,
   {
     memcpy(packet + RDT_HEADER_SIZE, payload, (size_t) payload_length);
   }
-  write_u16(packet + 2U, internet_checksum(packet, packet_length, 1));
+  write_u16(packet + 2U, checksum_bytes(packet, packet_length, 1));
   return packet_length;
 }
 
@@ -145,7 +141,7 @@ int rdt_decode_packet(const uint8_t *packet, size_t packet_length,
   decoded_length = read_u16(packet + 8U);
   if (decoded_length > RDT_MAX_PAYLOAD ||
       packet_length != RDT_HEADER_SIZE + (size_t) decoded_length ||
-      internet_checksum(packet, packet_length, 0) != 0U)
+      rdt_checksum(packet, packet_length) != 0U)
   {
     return -1;
   }
@@ -167,61 +163,4 @@ int rdt_decode_packet(const uint8_t *packet, size_t packet_length,
     *payload_length = decoded_length;
   }
   return 0;
-}
-
-/*
- * Public entry points compose the I/O adapter with the protocol state machine.
- */
-int rdt_send_file(const char *host, unsigned short port, const char *path,
-                  const struct rdt_options *options)
-{
-  struct rdt_io_context *context;
-  struct rdt_protocol_io io;
-  uint64_t file_size = 0U;
-  int result;
-  int close_result;
-
-  context = rdt_io_open(host, port, path, options, 1, &file_size);
-  if (context == NULL)
-  {
-    return 1;
-  }
-  rdt_io_get_protocol_io(context, &io);
-  result = rdt_protocol_send(&io, file_size, options);
-  close_result = rdt_io_close(context);
-
-  if (result == 0 && close_result == 0)
-  {
-    printf("Transfer complete: %" PRIu64 " bytes sent to %s\n", file_size,
-           host);
-    return 0;
-  }
-  return result == 2 ? 2 : 1;
-}
-
-int rdt_receive_file(const char *host, unsigned short port, const char *path,
-                     const struct rdt_options *options)
-{
-  struct rdt_io_context *context;
-  struct rdt_protocol_io io;
-  int result;
-  int close_result;
-
-  context = rdt_io_open(host, port, path, options, 0, NULL);
-  if (context == NULL)
-  {
-    return 1;
-  }
-  rdt_io_get_protocol_io(context, &io);
-  result = rdt_protocol_receive(&io, options);
-  close_result = rdt_io_close(context);
-
-  if (result == 0 && close_result == 0)
-  {
-    printf("Transfer complete: file received from %s\n", host);
-    return 0;
-  }
-  // GCOVR_EXCL_START
-  return result == 0 ? 0 : 1;
-  // GCOVR_EXCL_STOP
 }

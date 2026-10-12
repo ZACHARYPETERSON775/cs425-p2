@@ -27,18 +27,25 @@ times. `ERR <reason>` is reported to the user.
 
 ## Implementation layers
 
-The C implementation separates the wire/protocol concerns from operating
-system I/O:
+The C implementation has three layers:
 
 - `rdt.c` validates session names and encodes/decodes the packet header and
-  checksum. Its public send/receive functions compose the other layers.
-- `rdt_protocol.c` runs the Go-Back-N sender and receiver state machines using
-  injected datagram, clock, and file callbacks declared in `rdt_protocol.h`.
-- `rdt_io.c` implements those callbacks with UDP sockets, `poll`, the monotonic
-  clock, the relay HELLO exchange, and `FILE` operations.
+  checksum using pure byte-buffer functions. `rdt_checksum` is also tested
+  against RFC 1071's published vector and an odd-length input.
+- `rdt_protocol.c` contains pure sender and receiver state machines. The
+  `rdt_sender_step` and `rdt_receiver_step` functions consume explicit packet,
+  timer, and file-completion events and return actions such as sending a packet,
+  reading or writing file bytes, or waiting until a monotonic deadline. They do
+  not access sockets, clocks, or files.
+- `rdt_io.c` is the I/O driver: it performs relay HELLO, uses UDP and `poll`,
+  reads the monotonic clock, carries out returned file/network actions, and
+  feeds the resulting events back into the state machines.
 
-This lets protocol behavior be exercised through alternate callback
-implementations without binding it to the socket or filesystem implementation.
+Protocol tests drive the event functions directly with explicit timestamps and
+in-memory packets, so loss and timeout behavior can be controlled without a
+relay or real clock. Five fixed-seed in-memory transfer runs independently
+drop, corrupt, and duplicate packets in both directions and check the
+delivered file bytes against the source.
 
 ## Binary datagrams
 
@@ -62,18 +69,21 @@ configured number of unacknowledged chunks. ACK sequence numbers are cumulative:
 they identify the next DATA sequence expected by the receiver. Only in-order
 DATA is written; duplicate and out-of-order datagrams are discarded and elicit
 the current cumulative ACK. When the oldest outstanding DATA times out, the
-sender retransmits its entire outstanding window.
+sender retransmits its entire outstanding window. The sender gives up with
+status 2 after ten consecutive timeouts without an advancing ACK; an ACK that
+moves the base resets this timeout count.
 
-While awaiting transfer packets, the receiver exits with failure after 30
+While awaiting transfer packets, the receiver exits with status 2 after 30
 seconds without receiving a valid RDT datagram. Valid packets restart this idle
-timer; malformed or checksum-invalid datagrams do not. After accepting FIN, the
-receiver uses the separate bounded FIN linger period described below.
+timer; malformed or checksum-invalid datagrams do not.
 
 The final chunk may contain fewer than 1024 bytes. FIN uses the next DATA
-sequence number and carries the sender's timeout as a two-byte payload, allowing
-the receiver to linger long enough to answer a retransmitted FIN if its ACK was
-lost. The sender retransmits FIN after each timeout and returns exit status 2
-after ten timeouts without the final ACK. The receiver accepts FIN only after
-receiving all preceding DATA, responds with ACK sequence `FIN sequence + 1`, and
-lingers for ten sender timeout intervals plus one second to cover FIN retries.
-This also supports an empty file: its FIN sequence is zero.
+sequence number. The receiver accepts FIN only when `FIN sequence == expected`,
+flushes and closes the output file, increments `expected`, and sends ACK
+`expected`. It then lingers for two seconds, responding to repeated FIN packets
+with the same ACK before exiting successfully. This gives the sender time to
+recover if the final ACK was lost. An empty file uses FIN sequence zero and
+final ACK sequence one.
+
+The sender retransmits FIN after each timeout and returns exit status 2 after
+ten timeouts without the final ACK.

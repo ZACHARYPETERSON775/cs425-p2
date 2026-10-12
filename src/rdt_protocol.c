@@ -1,420 +1,424 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "rdt_protocol.h"
 
-#include <arpa/inet.h>
-#include <inttypes.h>
-#include <stdio.h>
 #include <string.h>
 
+#define DATA_MAX_TIMEOUTS 10U
 #define FIN_MAX_TIMEOUTS 10U
-#define FIN_LINGER_EXTRA_MS UINT64_C(1000)
-#define RECEIVE_IDLE_TIMEOUT_MS 30000
+#define FIN_LINGER_MS UINT64_C(2000)
+#define RECEIVE_IDLE_TIMEOUT_MS UINT64_C(30000)
 
-struct received_packet
+static void clear_actions(struct rdt_protocol_actions *actions)
 {
-  enum rdt_packet_type type;
-  uint32_t sequence;
-  uint8_t bytes[RDT_MAX_PACKET];
-  const uint8_t *payload;
-  uint32_t payload_length;
-};
-
-struct send_slot
-{
-  uint8_t bytes[RDT_MAX_PACKET];
-  size_t length;
-};
-
-static uint16_t read_u16(const uint8_t *bytes)
-{
-  uint16_t value;
-  memcpy(&value, bytes, sizeof(value));
-  return ntohs(value);
+  actions->count = 0U;
 }
 
-static void write_u16(uint8_t *bytes, uint16_t value)
+static struct rdt_protocol_action *add_action(
+    struct rdt_protocol_actions *actions,
+    enum rdt_protocol_action_type type)
 {
-  uint16_t network_value = htons(value);
-  memcpy(bytes, &network_value, sizeof(network_value));
+  struct rdt_protocol_action *action;
+
+  action = &actions->items[actions->count++];
+  memset(action, 0, sizeof(*action));
+  action->type = type;
+  return action;
 }
 
-static int protocol_io_is_valid(const struct rdt_protocol_io *io)
+static void add_wait(struct rdt_protocol_actions *actions, uint64_t deadline)
 {
-  return io != NULL && io->send_datagram != NULL &&
-         io->receive_datagram != NULL && io->now_ms != NULL &&
-         io->read_file != NULL && io->write_file != NULL &&
-         io->flush_file != NULL;
+  struct rdt_protocol_action *action =
+      add_action(actions, RDT_ACTION_WAIT_UNTIL);
+  action->deadline_ms = deadline;
 }
 
-static int receive_packet(const struct rdt_protocol_io *io, int timeout_ms,
-                          struct received_packet *received)
-{
-  uint64_t start = io->now_ms(io->context);
-
-  for (;;)
-  {
-    int remaining = timeout_ms;
-    size_t length = 0U;
-    int result;
-
-    if (timeout_ms >= 0)
-    {
-      uint64_t now = io->now_ms(io->context);
-      uint64_t elapsed = now >= start ? now - start : 0U;
-      if (elapsed >= (uint64_t) timeout_ms)
-      {
-        return 1;
-      }
-      remaining = (int) ((uint64_t) timeout_ms - elapsed);
-    }
-
-    result = io->receive_datagram(io->context, received->bytes,
-                                  sizeof(received->bytes), &length, remaining);
-    if (result != 0)
-    {
-      return result;
-    }
-    if (rdt_decode_packet(received->bytes, length, &received->type,
-                          &received->sequence, NULL,
-                          &received->payload_length) == 0)
-    {
-      received->payload = received->bytes + RDT_HEADER_SIZE;
-      return 0;
-    }
-  }
-}
-
-static int send_packet(const struct rdt_protocol_io *io,
+static void add_packet(struct rdt_protocol_actions *actions,
                        enum rdt_packet_type type, uint32_t sequence,
                        const uint8_t *payload, uint32_t payload_length)
 {
-  uint8_t packet[RDT_MAX_PACKET];
-  size_t length = rdt_encode_packet(packet, sizeof(packet), type, sequence,
-                                    payload, payload_length);
+  struct rdt_protocol_action *action =
+      add_action(actions, RDT_ACTION_SEND_PACKET);
 
-  if (length == 0U)
-  { // GCOVR_EXCL_START
-    fprintf(stderr, "Could not encode RDT packet\n");
+  action->length = rdt_encode_packet(action->bytes, sizeof(action->bytes),
+                                     type, sequence, payload, payload_length);
+}
+
+static void add_status_action(struct rdt_protocol_actions *actions,
+                              enum rdt_protocol_action_type type, int status)
+{
+  struct rdt_protocol_action *action = add_action(actions, type);
+  action->status = status;
+}
+
+static void sender_request_read(struct rdt_sender *sender,
+                                struct rdt_protocol_actions *actions)
+{
+  uint64_t offset;
+  uint64_t remaining;
+  size_t length;
+  struct rdt_protocol_action *action;
+
+  if (sender->read_pending != 0 || sender->next_sequence >= sender->total_packets ||
+      sender->next_sequence - sender->base >= sender->window_size)
+  {
+    return;
+  }
+  offset = sender->next_sequence * (uint64_t) RDT_MAX_PAYLOAD;
+  remaining = sender->file_size - offset;
+  length = remaining > (uint64_t) RDT_MAX_PAYLOAD
+               ? (size_t) RDT_MAX_PAYLOAD
+               : (size_t) remaining;
+  action = add_action(actions, RDT_ACTION_READ_FILE);
+  action->length = length;
+  sender->read_pending = 1;
+}
+
+static void sender_wait_or_read(struct rdt_sender *sender, uint64_t now_ms,
+                                struct rdt_protocol_actions *actions)
+{
+  if (sender->base == sender->total_packets)
+  {
+    sender->finishing = 1;
+    sender->timer_active = 1;
+    sender->deadline_ms = now_ms + (uint64_t) sender->timeout_ms;
+    add_packet(actions, RDT_FIN, (uint32_t) sender->total_packets, NULL, 0U);
+    add_wait(actions, sender->deadline_ms);
+    return;
+  }
+  sender_request_read(sender, actions);
+  if (sender->timer_active != 0)
+  {
+    add_wait(actions, sender->deadline_ms);
+  }
+}
+
+int rdt_sender_init(struct rdt_sender *sender, uint64_t file_size,
+                    unsigned int window_size, unsigned int timeout_ms,
+                    uint64_t now_ms, struct rdt_protocol_actions *actions)
+{
+  if (sender == NULL || actions == NULL || window_size == 0U ||
+      window_size > 64U || timeout_ms == 0U || timeout_ms > 60000U)
+  {
     return -1;
-  } // GCOVR_EXCL_STOP
-  return io->send_datagram(io->context, packet, length);
-}
-
-static int send_finish(const struct rdt_protocol_io *io,
-                       uint32_t packet_count, unsigned int timeout_ms)
-{
-  uint8_t payload[2];
-  uint32_t finish_ack = packet_count + 1U;
-  uint64_t next_send = 0U;
-  unsigned int timeouts = 0U;
-
-  write_u16(payload, (uint16_t) timeout_ms);
-  for (;;)
-  {
-    struct received_packet received;
-    uint64_t now = io->now_ms(io->context);
-    int wait_ms;
-    int result;
-
-    if (now >= next_send)
-    {
-      if (send_packet(io, RDT_FIN, packet_count, payload,
-                      (uint32_t) sizeof(payload)) != 0)
-      {
-        return -1;
-      }
-      next_send = io->now_ms(io->context) + (uint64_t) timeout_ms;
-    }
-    now = io->now_ms(io->context);
-    wait_ms = now >= next_send ? 0 : (int) (next_send - now);
-    result = receive_packet(io, wait_ms, &received);
-    if (result < 0)
-    { // GCOVR_EXCL_START
-      return -1;
-    } // GCOVR_EXCL_STOP
-    if (result == 1)
-    {
-      ++timeouts;
-      if (timeouts >= FIN_MAX_TIMEOUTS)
-      {
-        fprintf(stderr, "FIN was not acknowledged after %u timeouts\n",
-                FIN_MAX_TIMEOUTS);
-        return 2;
-      }
-    }
-    if (result == 0 && received.type == RDT_ACK &&
-        received.sequence == finish_ack && received.payload_length == 0U)
-    {
-      return 0;
-    }
   }
-}
-
-static int fill_send_window(const struct rdt_protocol_io *io,
-                            uint64_t file_size, uint64_t total_packets,
-                            uint64_t *next_sequence, uint64_t base,
-                            unsigned int window_size,
-                            struct send_slot *slots)
-{
-  while (*next_sequence < total_packets &&
-         *next_sequence - base < (uint64_t) window_size)
+  memset(sender, 0, sizeof(*sender));
+  clear_actions(actions);
+  sender->file_size = file_size;
+  sender->total_packets =
+      file_size / (uint64_t) RDT_MAX_PAYLOAD +
+      (file_size % (uint64_t) RDT_MAX_PAYLOAD == 0U ? 0U : 1U);
+  if (sender->total_packets >= (uint64_t) UINT32_MAX)
   {
-    uint64_t offset = *next_sequence * (uint64_t) RDT_MAX_PAYLOAD;
-    uint64_t remaining = file_size - offset;
-    uint32_t chunk_length = remaining > (uint64_t) RDT_MAX_PAYLOAD
-                              ? RDT_MAX_PAYLOAD
-                              : (uint32_t) remaining;
-    struct send_slot *slot = &slots[*next_sequence % (uint64_t) window_size];
-    size_t packet_length;
-
-    if (io->read_file(io->context, slot->bytes + RDT_HEADER_SIZE,
-                      (size_t) chunk_length) != 0)
-    { // GCOVR_EXCL_START
-      fprintf(stderr, "Could not read expected bytes from input file\n");
-      return -1;
-    } // GCOVR_EXCL_STOP
-    packet_length = rdt_encode_packet(slot->bytes, sizeof(slot->bytes),
-                                      RDT_DATA, (uint32_t) *next_sequence,
-                                      slot->bytes + RDT_HEADER_SIZE,
-                                      chunk_length);
-    if (packet_length == 0U)
-    { // GCOVR_EXCL_START
-      fprintf(stderr, "Could not encode data packet\n");
-      return -1;
-    } // GCOVR_EXCL_STOP
-    slot->length = packet_length;
-    if (io->send_datagram(io->context, slot->bytes, slot->length) != 0)
-    { // GCOVR_EXCL_START
-      return -1;
-    } // GCOVR_EXCL_STOP
-    ++*next_sequence;
+    return -1;
   }
+  sender->window_size = window_size;
+  sender->timeout_ms = timeout_ms;
+  if (sender->total_packets == 0U)
+  {
+    sender_wait_or_read(sender, now_ms, actions);
+    return 0;
+  }
+  sender_request_read(sender, actions);
   return 0;
 }
 
-int rdt_protocol_send(const struct rdt_protocol_io *io, uint64_t file_size,
-                      const struct rdt_options *options)
+static void sender_emit_outstanding(struct rdt_sender *sender,
+                                    struct rdt_protocol_actions *actions)
 {
-  struct send_slot slots[64];
-  uint64_t total_packets;
-  uint64_t base = 0U;
-  uint64_t next_sequence = 0U;
-  uint64_t deadline = 0U;
-  int timer_active = 0;
+  uint64_t sequence;
 
-  if (!protocol_io_is_valid(io) || options == NULL ||
-      options->window_size == 0U || options->window_size > 64U ||
-      options->timeout_ms == 0U || options->timeout_ms > 60000U)
+  for (sequence = sender->base; sequence < sender->next_sequence; ++sequence)
   {
-    fprintf(stderr, "Invalid protocol I/O or sender options\n");
-    return 1;
+    struct rdt_sender_slot *slot =
+        &sender->slots[sequence % (uint64_t) sender->window_size];
+    struct rdt_protocol_action *action =
+        add_action(actions, RDT_ACTION_SEND_PACKET);
+    memcpy(action->bytes, slot->bytes, slot->length);
+    action->length = slot->length;
+  }
+}
+
+int rdt_sender_step(struct rdt_sender *sender,
+                    const struct rdt_sender_event *event,
+                    struct rdt_protocol_actions *actions)
+{
+  if (sender == NULL || event == NULL || actions == NULL)
+  {
+    return -1;
+  }
+  clear_actions(actions);
+  if (sender->done != 0)
+  {
+    add_status_action(actions, RDT_ACTION_COMPLETE, 0);
+    return 0;
+  }
+  if (event->type == RDT_SENDER_EVENT_IO_FAILURE)
+  {
+    sender->done = 1;
+    add_status_action(actions, RDT_ACTION_FAILED, 1);
+    return 0;
   }
 
-  total_packets = file_size / (uint64_t) RDT_MAX_PAYLOAD +
-                  (file_size % (uint64_t) RDT_MAX_PAYLOAD == 0U ? 0U : 1U);
-  if (total_packets >= (uint64_t) UINT32_MAX)
-  { // GCOVR_EXCL_START
-    fprintf(stderr, "Input is too large for the 32-bit sequence space\n");
-    return 1;
-  } // GCOVR_EXCL_STOP
-
-  /*
-   * base is the oldest unacknowledged DATA sequence and next_sequence is the
-   * next chunk to send. ACKs advance base cumulatively; on timeout all packets
-   * from base through next_sequence - 1 are retransmitted.
-   */
-  while (base < total_packets)
+  if (sender->finishing != 0)
   {
-    struct received_packet received;
-    uint64_t old_next = next_sequence;
-    uint64_t now;
-    int wait_ms;
-    int packet_result;
-
-    if (fill_send_window(io, file_size, total_packets, &next_sequence, base,
-                         options->window_size, slots) != 0)
-    { // GCOVR_EXCL_START
-      return 1;
-    } // GCOVR_EXCL_STOP
-    if (next_sequence > old_next && timer_active == 0)
+    if (event->type == RDT_SENDER_EVENT_ACK &&
+        event->packet.type == RDT_ACK &&
+        event->packet.payload_length == 0U &&
+        (uint64_t) event->packet.sequence == sender->total_packets + 1U)
     {
-      deadline = io->now_ms(io->context) + (uint64_t) options->timeout_ms;
-      timer_active = 1;
+      sender->done = 1;
+      add_status_action(actions, RDT_ACTION_COMPLETE, 0);
+      return 0;
     }
-
-    now = io->now_ms(io->context);
-    wait_ms = now >= deadline ? 0 : (int) (deadline - now);
-    packet_result = receive_packet(io, wait_ms, &received);
-    if (packet_result < 0)
-    { // GCOVR_EXCL_START
-      return 1;
-    } // GCOVR_EXCL_STOP
-    if (packet_result == 1)
+    if (event->type == RDT_SENDER_EVENT_TIMER &&
+        event->now_ms >= sender->deadline_ms)
     {
-      uint64_t sequence;
-      for (sequence = base; sequence < next_sequence; ++sequence)
+      ++sender->consecutive_timeouts;
+      if (sender->consecutive_timeouts >= FIN_MAX_TIMEOUTS)
       {
-        struct send_slot *slot =
-            &slots[sequence % (uint64_t) options->window_size];
-        if (io->send_datagram(io->context, slot->bytes, slot->length) != 0)
-        { // GCOVR_EXCL_START
-          return 1;
-        } // GCOVR_EXCL_STOP
+        sender->done = 1;
+        add_status_action(actions, RDT_ACTION_FAILED, 2);
+        return 0;
       }
-      deadline = io->now_ms(io->context) + (uint64_t) options->timeout_ms;
-      timer_active = 1;
-      continue;
+      sender->deadline_ms = event->now_ms + (uint64_t) sender->timeout_ms;
+      add_packet(actions, RDT_FIN, (uint32_t) sender->total_packets, NULL, 0U);
     }
+    add_wait(actions, sender->deadline_ms);
+    return 0;
+  }
 
-    if (received.type == RDT_ACK && received.payload_length == 0U &&
-        (uint64_t) received.sequence > base &&
-        (uint64_t) received.sequence <= next_sequence)
+  if (event->type == RDT_SENDER_EVENT_DATA_READY)
+  {
+    uint64_t offset;
+    uint64_t remaining;
+    size_t expected_length;
+    struct rdt_sender_slot *slot;
+
+    if (sender->read_pending == 0 || event->bytes == NULL)
     {
-      base = received.sequence;
-      if (base < next_sequence)
+      return -1;
+    }
+    offset = sender->next_sequence * (uint64_t) RDT_MAX_PAYLOAD;
+    remaining = sender->file_size - offset;
+    expected_length = remaining > (uint64_t) RDT_MAX_PAYLOAD
+                          ? (size_t) RDT_MAX_PAYLOAD
+                          : (size_t) remaining;
+    if (event->length != expected_length)
+    {
+      sender->done = 1;
+      add_status_action(actions, RDT_ACTION_FAILED, 1);
+      return 0;
+    }
+    slot = &sender->slots[sender->next_sequence %
+                          (uint64_t) sender->window_size];
+    slot->length = rdt_encode_packet(
+        slot->bytes, sizeof(slot->bytes), RDT_DATA,
+        (uint32_t) sender->next_sequence, event->bytes,
+        (uint32_t) event->length);
+    sender->read_pending = 0;
+    add_packet(actions, RDT_DATA, (uint32_t) sender->next_sequence,
+               event->bytes, (uint32_t) event->length);
+    ++sender->next_sequence;
+    if (sender->timer_active == 0)
+    {
+      sender->timer_active = 1;
+      sender->deadline_ms = event->now_ms + (uint64_t) sender->timeout_ms;
+    }
+    sender_wait_or_read(sender, event->now_ms, actions);
+    return 0;
+  }
+
+  if (event->type == RDT_SENDER_EVENT_ACK &&
+      event->packet.type == RDT_ACK &&
+      event->packet.payload_length == 0U &&
+      (uint64_t) event->packet.sequence > sender->base &&
+      (uint64_t) event->packet.sequence <= sender->next_sequence)
+  {
+    sender->base = event->packet.sequence;
+    sender->consecutive_timeouts = 0U;
+    if (sender->base < sender->next_sequence)
+    {
+      sender->timer_active = 1;
+      sender->deadline_ms = event->now_ms + (uint64_t) sender->timeout_ms;
+    }
+    else
+    {
+      sender->timer_active = 0;
+    }
+    sender_wait_or_read(sender, event->now_ms, actions);
+    return 0;
+  }
+
+  if (event->type == RDT_SENDER_EVENT_TIMER &&
+      sender->timer_active != 0 && event->now_ms >= sender->deadline_ms)
+  {
+    ++sender->consecutive_timeouts;
+    if (sender->consecutive_timeouts >= DATA_MAX_TIMEOUTS)
+    {
+      sender->done = 1;
+      add_status_action(actions, RDT_ACTION_FAILED, 2);
+      return 0;
+    }
+    sender_emit_outstanding(sender, actions);
+    sender->deadline_ms = event->now_ms + (uint64_t) sender->timeout_ms;
+  }
+  sender_wait_or_read(sender, event->now_ms, actions);
+  return 0;
+}
+
+static void receiver_ack(struct rdt_receiver *receiver,
+                         struct rdt_protocol_actions *actions)
+{
+  add_packet(actions, RDT_ACK, (uint32_t) receiver->expected, NULL, 0U);
+}
+
+int rdt_receiver_init(struct rdt_receiver *receiver, uint64_t now_ms,
+                      struct rdt_protocol_actions *actions)
+{
+  if (receiver == NULL || actions == NULL)
+  {
+    return -1;
+  }
+  memset(receiver, 0, sizeof(*receiver));
+  clear_actions(actions);
+  receiver->phase = RDT_RECEIVER_ACTIVE;
+  receiver->idle_deadline_ms = now_ms + RECEIVE_IDLE_TIMEOUT_MS;
+  add_wait(actions, receiver->idle_deadline_ms);
+  return 0;
+}
+
+int rdt_receiver_step(struct rdt_receiver *receiver,
+                      const struct rdt_receiver_event *event,
+                      struct rdt_protocol_actions *actions)
+{
+  if (receiver == NULL || event == NULL || actions == NULL)
+  {
+    return -1;
+  }
+  clear_actions(actions);
+  if (event->type == RDT_RECEIVER_EVENT_IO_FAILURE)
+  {
+    receiver->phase = RDT_RECEIVER_FAILED;
+    add_status_action(actions, RDT_ACTION_FAILED, 1);
+    return 0;
+  }
+  if (receiver->phase == RDT_RECEIVER_DONE)
+  {
+    add_status_action(actions, RDT_ACTION_COMPLETE, 0);
+    return 0;
+  }
+  if (receiver->phase == RDT_RECEIVER_FAILED)
+  {
+    add_status_action(actions, RDT_ACTION_FAILED, 1);
+    return 0;
+  }
+  if (receiver->phase == RDT_RECEIVER_ACTIVE &&
+      event->type == RDT_RECEIVER_EVENT_TIMER &&
+      event->now_ms >= receiver->idle_deadline_ms)
+  {
+    receiver->phase = RDT_RECEIVER_FAILED;
+    add_status_action(actions, RDT_ACTION_FAILED, 2);
+    return 0;
+  }
+  if (receiver->phase == RDT_RECEIVER_LINGER &&
+      event->type == RDT_RECEIVER_EVENT_TIMER &&
+      event->now_ms >= receiver->linger_deadline_ms)
+  {
+    receiver->phase = RDT_RECEIVER_DONE;
+    add_status_action(actions, RDT_ACTION_COMPLETE, 0);
+    return 0;
+  }
+
+  if (event->type == RDT_RECEIVER_EVENT_PACKET &&
+      receiver->phase == RDT_RECEIVER_ACTIVE)
+  {
+    receiver->idle_deadline_ms = event->now_ms + RECEIVE_IDLE_TIMEOUT_MS;
+    if (event->packet.type == RDT_DATA)
+    {
+      if ((uint64_t) event->packet.sequence != receiver->expected ||
+          event->packet.payload_length == 0U ||
+          event->packet.payload_length > RDT_MAX_PAYLOAD)
       {
-        deadline = io->now_ms(io->context) +
-                   (uint64_t) options->timeout_ms;
-        timer_active = 1;
+        receiver_ack(receiver, actions);
       }
       else
       {
-        timer_active = 0;
+        memcpy(receiver->pending_payload, event->packet.payload,
+               event->packet.payload_length);
+        receiver->pending_length = event->packet.payload_length;
+        receiver->phase = RDT_RECEIVER_WRITING;
+        struct rdt_protocol_action *action =
+            add_action(actions, RDT_ACTION_WRITE_FILE);
+        memcpy(action->bytes, receiver->pending_payload,
+               receiver->pending_length);
+        action->length = receiver->pending_length;
       }
     }
+    else if (event->packet.type == RDT_FIN)
+    {
+      if ((uint64_t) event->packet.sequence != receiver->expected)
+      {
+        receiver_ack(receiver, actions);
+      }
+      else
+      {
+        receiver->fin_sequence = event->packet.sequence;
+        receiver->phase = RDT_RECEIVER_FLUSHING;
+        (void) add_action(actions, RDT_ACTION_FLUSH_FILE);
+      }
+    }
+    if (receiver->phase == RDT_RECEIVER_ACTIVE)
+    {
+      add_wait(actions, receiver->idle_deadline_ms);
+    }
+    return 0;
   }
 
-  return send_finish(io, (uint32_t) total_packets, options->timeout_ms);
-}
-
-static int send_ack(const struct rdt_protocol_io *io, uint32_t sequence)
-{
-  return send_packet(io, RDT_ACK, sequence, NULL, 0U);
-}
-
-static int receive_linger(const struct rdt_protocol_io *io,
-                          uint32_t packet_count, unsigned int timeout_ms)
-{
-  uint32_t finish_ack = packet_count + 1U;
-  uint64_t deadline = io->now_ms(io->context) +
-                      (uint64_t) timeout_ms * (uint64_t) FIN_MAX_TIMEOUTS +
-                      FIN_LINGER_EXTRA_MS;
-
-  /* Re-ACK duplicate FINs for the full FIN retransmission period. */
-  while (io->now_ms(io->context) < deadline)
+  if (receiver->phase == RDT_RECEIVER_LINGER &&
+      event->type == RDT_RECEIVER_EVENT_PACKET)
   {
-    struct received_packet received;
-    uint64_t now = io->now_ms(io->context);
-    int remaining = (int) (deadline - now);
-    int result = receive_packet(io, remaining, &received);
-
-    if (result < 0)
+    if (event->packet.type == RDT_FIN &&
+        event->packet.sequence == receiver->fin_sequence)
     {
-      return -1;
+      receiver->expected = (uint64_t) receiver->fin_sequence + 1U;
+      receiver_ack(receiver, actions);
     }
-    if (result == 1)
+    add_wait(actions, receiver->linger_deadline_ms);
+    return 0;
+  }
+
+  if (event->type == RDT_RECEIVER_EVENT_FILE_OK)
+  {
+    if (receiver->phase == RDT_RECEIVER_WRITING)
     {
+      ++receiver->expected;
+      receiver->phase = RDT_RECEIVER_ACTIVE;
+      receiver->idle_deadline_ms = event->now_ms + RECEIVE_IDLE_TIMEOUT_MS;
+      receiver_ack(receiver, actions);
+      add_wait(actions, receiver->idle_deadline_ms);
       return 0;
     }
-    if (received.type == RDT_FIN && received.sequence == packet_count &&
-        received.payload_length == 2U &&
-        read_u16(received.payload) == timeout_ms)
+    if (receiver->phase == RDT_RECEIVER_FLUSHING)
     {
-      if (send_ack(io, finish_ack) != 0)
-      { // GCOVR_EXCL_START
-        return -1;
-      } // GCOVR_EXCL_STOP
+      receiver->phase = RDT_RECEIVER_CLOSING;
+      (void) add_action(actions, RDT_ACTION_CLOSE_FILE);
+      return 0;
     }
-    else if (received.type == RDT_DATA && received.sequence < packet_count)
+    if (receiver->phase == RDT_RECEIVER_CLOSING)
     {
-      if (send_ack(io, packet_count) != 0)
-      { // GCOVR_EXCL_START
-        return -1;
-      } // GCOVR_EXCL_STOP
+      receiver->expected = (uint64_t) receiver->fin_sequence + 1U;
+      receiver->phase = RDT_RECEIVER_LINGER;
+      receiver->linger_deadline_ms = event->now_ms + FIN_LINGER_MS;
+      receiver_ack(receiver, actions);
+      add_wait(actions, receiver->linger_deadline_ms);
+      return 0;
     }
-  } // GCOVR_EXCL_START
+  }
+
+  if (event->type == RDT_RECEIVER_EVENT_TIMER)
+  {
+    add_wait(actions, receiver->phase == RDT_RECEIVER_LINGER
+                          ? receiver->linger_deadline_ms
+                          : receiver->idle_deadline_ms);
+  }
   return 0;
-} // GCOVR_EXCL_STOP
-
-int rdt_protocol_receive(const struct rdt_protocol_io *io,
-                         const struct rdt_options *options)
-{
-  uint64_t expected = 0U;
-  uint32_t packet_count;
-  unsigned int sender_timeout;
-
-  if (!protocol_io_is_valid(io) || options == NULL)
-  {
-    fprintf(stderr, "Invalid protocol I/O or receiver options\n");
-    return 1;
-  }
-
-  for (;;)
-  {
-    struct received_packet received;
-    int receive_result = receive_packet(io, RECEIVE_IDLE_TIMEOUT_MS,
-                                        &received);
-
-    if (receive_result < 0)
-    {
-      return 1;
-    }
-    if (receive_result == 1)
-    {
-      fprintf(stderr, "Receiver timed out after 30 seconds without a valid packet\n");
-      return 1;
-    }
-    if (received.type == RDT_DATA)
-    {
-      if ((uint64_t) received.sequence == expected &&
-          received.payload_length > 0U &&
-          received.payload_length <= RDT_MAX_PAYLOAD)
-      {
-        if (io->write_file(io->context, received.payload,
-                           (size_t) received.payload_length) != 0)
-        { // GCOVR_EXCL_START
-          fprintf(stderr, "Could not write output file\n");
-          return 1;
-        } // GCOVR_EXCL_STOP
-        ++expected;
-      }
-      if (send_ack(io, (uint32_t) expected) != 0)
-      { // GCOVR_EXCL_START
-        return 1;
-      } // GCOVR_EXCL_STOP
-    }
-    else if (received.type == RDT_FIN)
-    {
-      if ((uint64_t) received.sequence != expected ||
-          received.payload_length != 2U)
-      { // GCOVR_EXCL_START
-        if (send_ack(io, (uint32_t) expected) != 0)
-        {
-          return 1;
-        }
-        continue;
-      } // GCOVR_EXCL_STOP
-      sender_timeout = read_u16(received.payload);
-      if (sender_timeout == 0U || sender_timeout > 60000U)
-      { // GCOVR_EXCL_START
-        if (send_ack(io, (uint32_t) expected) != 0)
-        {
-          return 1;
-        }
-        continue;
-      } // GCOVR_EXCL_STOP
-      if (io->flush_file(io->context) != 0)
-      { // GCOVR_EXCL_START
-        fprintf(stderr, "Could not flush output file\n");
-        return 1;
-      } // GCOVR_EXCL_STOP
-      packet_count = (uint32_t) expected;
-      if (send_ack(io, packet_count + 1U) != 0)
-      { // GCOVR_EXCL_START
-        return 1;
-      } // GCOVR_EXCL_STOP
-      return receive_linger(io, packet_count, sender_timeout);
-    }
-  }
 }
